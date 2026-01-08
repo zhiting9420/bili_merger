@@ -6,10 +6,14 @@ class DanmakuOptions {
   final int resY;
   final int fontSize;
   final double duration;
-  final double opacity; // 0.0 to 1.0
+  final double opacity;
   final bool bold;
   final String fontName;
-  final double area; // 0.0 to 1.0 (screen coverage)
+  final double area;
+  final bool noOverlap;
+  final bool showCritical;
+  final bool showScroll;
+  final bool showFixed;
 
   DanmakuOptions({
     this.resX = 1920,
@@ -18,8 +22,12 @@ class DanmakuOptions {
     this.duration = 10.0,
     this.opacity = 0.7,
     this.bold = false,
-    this.fontName = "Heiti",
+    this.fontName = "黑体",
     this.area = 0.5,
+    this.noOverlap = true,
+    this.showCritical = false,
+    this.showScroll = true,
+    this.showFixed = true,
   });
 }
 
@@ -47,6 +55,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
   }
 
   static String _formatTime(double seconds) {
+    if (seconds < 0) seconds = 0;
     int h = (seconds / 3600).floor();
     int m = ((seconds % 3600) / 60).floor();
     int s = (seconds % 60).floor();
@@ -59,19 +68,25 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     try {
       final document = XmlDocument.parse(xmlContent);
       final events = <String>[];
-      int rollChannel = 0;
+      int rollChannelCounter = 0;
 
-      final dNodes = document.findAllElements('d');
+      final dNodes = document.findAllElements('d').toList();
       
-      // Calculate layout parameters
-      final int maxChannels = ((opt.resY * opt.area) / (opt.fontSize * 1.2)).floor();
-      final double lineSpacing = opt.fontSize * 1.2;
+      // Sort nodes by start time
+      dNodes.sort((a, b) {
+         final pa = (a.getAttribute('p') ?? "0").split(',');
+         final pb = (b.getAttribute('p') ?? "0").split(',');
+         return (double.tryParse(pa[0]) ?? 0).compareTo(double.tryParse(pb[0]) ?? 0);
+      });
 
+      // Layout parameters
+      final double lineSpacing = opt.fontSize * 1.3;
+      final int maxChannels = ((opt.resY * opt.area) / lineSpacing).floor().clamp(1, 30);
+      
       for (var node in dNodes) {
         final pAttr = node.getAttribute('p');
-        final text = node.innerText;
-
-        if (pAttr == null) continue;
+        final text = node.innerText.trim();
+        if (pAttr == null || text.isEmpty) continue;
 
         final params = pAttr.split(',');
         if (params.length < 4) continue;
@@ -80,46 +95,48 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         final mode = int.tryParse(params[1]) ?? 1;
         final colorDec = int.tryParse(params[3]) ?? 16777215;
 
-        // Color conversion Decimal -> ASS Hex (BBGGRR)
+        // Filtering
+        if (mode == 1 || mode == 2 || mode == 3) {
+          if (!opt.showScroll) continue;
+        } else if (mode == 4 || mode == 5) {
+          if (!opt.showFixed) continue;
+        } else {
+          continue; // Filter unknown modes
+        }
+
+        // Color
         final blue = colorDec & 0xFF;
         final green = (colorDec >> 8) & 0xFF;
         final red = (colorDec >> 16) & 0xFF;
         final assColor = "&H00${blue.toRadixString(16).padLeft(2, '0').toUpperCase()}${green.toRadixString(16).padLeft(2, '0').toUpperCase()}${red.toRadixString(16).padLeft(2, '0').toUpperCase()}";
-        
         final colorTag = (colorDec != 16777215) ? "{\\c$assColor}" : "";
 
-        double duration = (mode == 1 || mode == 2 || mode == 3) ? opt.duration : 4.0;
-        final endSec = startSec + duration;
-
+        double duration = (mode <= 3) ? opt.duration : 4.0;
         final tStart = _formatTime(startSec);
-        final tEnd = _formatTime(endSec);
+        final tEnd = _formatTime(startSec + duration);
 
-        String line = "";
-
-        if (mode == 1 || mode == 2 || mode == 3) {
+        if (mode <= 3) {
            // Roll
-           final yPos = (opt.resY * 0.05) + (rollChannel % maxChannels) * lineSpacing;
-           rollChannel++;
-
-           final textLenEst = text.length * opt.fontSize;
-           final xStart = opt.resX + 100;
-           final xEnd = -100 - textLenEst;
+           final channel = rollChannelCounter % maxChannels;
+           rollChannelCounter++;
            
-           line = "Dialogue: 0,$tStart,$tEnd,Roll,,0,0,0,,$colorTag{\\move($xStart,$yPos,$xEnd,$yPos)}$text";
+           final yPos = (opt.resY * 0.05) + (channel * lineSpacing);
+           final xStart = opt.resX + 50;
+           // Estimate width: characters * fontSize * modifier
+           final textWidth = text.length * opt.fontSize * 0.8;
+           final xEnd = -50 - textWidth;
+
+           events.add("Dialogue: 0,$tStart,$tEnd,Roll,,0,0,0,,$colorTag{\\move($xStart,$yPos,$xEnd,$yPos)}$text");
         } else if (mode == 5) {
-          // Top
-           line = "Dialogue: 0,$tStart,$tEnd,Top,,0,0,0,,$colorTag$text";
-        } else {
-          // Bottom (and others fallback)
-           line = "Dialogue: 0,$tStart,$tEnd,Bottom,,0,0,0,,$colorTag$text";
+           events.add("Dialogue: 0,$tStart,$tEnd,Top,,0,0,0,,$colorTag$text");
+        } else if (mode == 4) {
+           events.add("Dialogue: 0,$tStart,$tEnd,Bottom,,0,0,0,,$colorTag$text");
         }
-        events.add(line);
       }
 
       return _generateHeader(opt) + events.join('\n');
-
     } catch (e) {
-      print("Error parsing XML: $e");
+      print("Error converting danmaku: $e");
       return _generateHeader(opt);
     }
   }
