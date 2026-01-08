@@ -24,7 +24,7 @@
 ### 编译与运行
 1. **克隆项目**
    ```bash
-   git clone https://github.com/z/bili_merger.git
+   git clone https://github.com/zhiting9420/bili_merger.git
    cd bili_merger
    ```
 
@@ -53,7 +53,7 @@
 
 ## 📋 使用流程
 1. 打开 App，授予存储读写权限。
-2. 点击“扫描”或选择 B 站缓存根目录。
+2. 点击选择 B 站缓存目录。
 3. 在列表中选择需要合并的任务，点击开始。
 4. 合并完成后，可在指定的文件夹中查看 MP4 文件。
 
