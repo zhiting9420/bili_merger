@@ -1,0 +1,64 @@
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ related
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# The .vscode folder contains launch configuration and tasks you configure in
+# VS Code which you may wish to be included in version control, so this line
+# is commented out by default.
+#.vscode/
+
+# Flutter/Dart/Pub related
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+/build/
+/coverage/
+
+# Symbolication related
+app.*.symbols
+
+# Obfuscation related
+app.*.map.json
+
+# Android Studio will place build artifacts here
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# 预编译 FFmpeg 原始包(二进制已解入 android/app/src/main/jniLibs，无需入库)
+/ffmpeg-android-arm64.zip
+/ffmpeg-android-arm.zip
+
+# 本地开发辅助文件,不推送到公开仓库
+/CLAUDE.md
+/future.txt
+
+# 签名密钥与密码,绝不能进仓库(丢失将无法更新应用,请自行离线备份)
+**/key.properties
+**/*.jks
+**/*.keystore
+
+# 导出的 APK 产物(走 GitHub Release / 网盘,不入源码仓库)
+/dist/
+
+# 任意层级的构建产物(如 android/build)
+build/
