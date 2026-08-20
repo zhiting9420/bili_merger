@@ -4,8 +4,6 @@ import '../utils/xml_to_ass.dart';
 
 class SettingsService extends ChangeNotifier {
   static const String _keyParseDanmaku = 'parse_danmaku';
-  static const String _keyResX = 'res_x';
-  static const String _keyResY = 'res_y';
   static const String _keyFontSize = 'font_size';
   static const String _keyDuration = 'duration';
   static const String _keyOpacity = 'opacity';
@@ -14,8 +12,8 @@ class SettingsService extends ChangeNotifier {
   static const String _keyArea = 'area';
   static const String _keySpeed = 'danmaku_speed';
   static const String _keyNoOverlap = 'no_overlap';
-  static const String _keyShowScroll = 'show_scroll';
-  static const String _keyShowFixed = 'show_fixed';
+  static const String _keyFilter = 'danmaku_filter';
+  static const String _keyDedupe = 'danmaku_dedupe';
   static const String _keySeedColor = 'seed_color';
 
   late SharedPreferences _prefs;
@@ -30,17 +28,19 @@ class SettingsService extends ChangeNotifier {
   String _fontName = "微软雅黑";
 
   // Danmaku Parameters
-  int _resX = 1920;
-  int _resY = 1080;
+  // 弹幕坐标系固定 1080P。libass 总会把弹幕按比例缩放到视频实际分辨率,
+  // 所以这个值只决定「字号相对画面多大」,不影响清晰度 —— 交给字号一个开关控制即可。
+  static const int _kResX = 1920;
+  static const int _kResY = 1080;
   int _fontSize = 50;
   double _duration = 10.0;
-  double _opacity = 0.7;
+  double _opacity = 0.8;
   bool _bold = false;
   double _area = 0.5;
-  double _speed = 1.0;
+  double _speed = 1.25;
   bool _noOverlap = true;
-  bool _showScroll = true;
-  bool _showFixed = true;
+  DanmakuFilter _filter = DanmakuFilter.all;
+  bool _dedupe = true;
 
   SettingsService() {
     _init();
@@ -51,17 +51,18 @@ class SettingsService extends ChangeNotifier {
     _parseDanmaku = _prefs.getBool(_keyParseDanmaku) ?? true;
     _seedColorValue = _prefs.getInt(_keySeedColor) ?? 0xFF4CAF50;
     _fontName = _prefs.getString(_keyFontName) ?? "微软雅黑";
-    _resX = _prefs.getInt(_keyResX) ?? 1920;
-    _resY = _prefs.getInt(_keyResY) ?? 1080;
     _fontSize = _prefs.getInt(_keyFontSize) ?? 50;
     _duration = _prefs.getDouble(_keyDuration) ?? 10.0;
-    _opacity = _prefs.getDouble(_keyOpacity) ?? 0.7;
+    _opacity = _prefs.getDouble(_keyOpacity) ?? 0.8;
     _bold = _prefs.getBool(_keyBold) ?? false;
     _area = _prefs.getDouble(_keyArea) ?? 0.5;
-    _speed = _prefs.getDouble(_keySpeed) ?? 1.0;
+    _speed = _prefs.getDouble(_keySpeed) ?? 1.25;
     _noOverlap = _prefs.getBool(_keyNoOverlap) ?? true;
-    _showScroll = _prefs.getBool(_keyShowScroll) ?? true;
-    _showFixed = _prefs.getBool(_keyShowFixed) ?? true;
+    _filter =
+        DanmakuFilter.values[(_prefs.getInt(_keyFilter) ??
+                DanmakuFilter.all.index)
+            .clamp(0, DanmakuFilter.values.length - 1)];
+    _dedupe = _prefs.getBool(_keyDedupe) ?? true;
 
     _isInitialized = true;
     notifyListeners();
@@ -70,8 +71,8 @@ class SettingsService extends ChangeNotifier {
   // Getters
   int get seedColorValue => _seedColorValue;
   String get fontName => _fontName;
-  int get resX => _resX;
-  int get resY => _resY;
+  int get resX => _kResX;
+  int get resY => _kResY;
   int get fontSize => _fontSize;
   double get duration => _duration;
   double get opacity => _opacity;
@@ -79,13 +80,13 @@ class SettingsService extends ChangeNotifier {
   double get area => _area;
   double get speed => _speed;
   bool get noOverlap => _noOverlap;
-  bool get showScroll => _showScroll;
-  bool get showFixed => _showFixed;
+  DanmakuFilter get filter => _filter;
+  bool get dedupe => _dedupe;
   bool get isInitialized => _isInitialized;
 
   DanmakuOptions get danmakuOptions => DanmakuOptions(
-    resX: _resX,
-    resY: _resY,
+    resX: _kResX,
+    resY: _kResY,
     fontSize: _fontSize,
     duration: _duration / _speed,
     opacity: _opacity,
@@ -93,25 +94,40 @@ class SettingsService extends ChangeNotifier {
     fontName: _fontName,
     area: _area,
     noOverlap: _noOverlap,
-    showScroll: _showScroll,
-    showFixed: _showFixed,
+    filter: _filter,
+    dedupe: _dedupe,
+  );
+
+  /// 弹幕烧录专用参数。除字体必须换成随应用打包的那一份(内置 ffmpeg 没有
+  /// fontconfig,只认 fontsdir 里的这一个家族)之外,其余一律沿用用户设置,
+  /// 筛选模式也包括在内 —— 设置里选什么,烧进画面的就是什么。
+  DanmakuOptions burnDanmakuOptions(String fontFamily) => DanmakuOptions(
+    resX: _kResX,
+    resY: _kResY,
+    fontSize: _fontSize,
+    duration: _duration / _speed,
+    opacity: _opacity,
+    bold: _bold,
+    fontName: fontFamily,
+    area: _area,
+    noOverlap: _noOverlap,
+    filter: _filter,
+    dedupe: _dedupe,
   );
 
   void resetToDefaults() {
     _parseDanmaku = true;
     _seedColorValue = 0xFF4CAF50;
     _fontName = "微软雅黑";
-    _resX = 1920;
-    _resY = 1080;
     _fontSize = 50;
     _duration = 10.0;
-    _opacity = 0.7;
+    _opacity = 0.8;
     _bold = false;
     _area = 0.5;
-    _speed = 1.0;
+    _speed = 1.25;
     _noOverlap = true;
-    _showScroll = true;
-    _showFixed = true;
+    _filter = DanmakuFilter.all;
+    _dedupe = true;
     _prefs.clear();
     notifyListeners();
   }
@@ -171,33 +187,21 @@ class SettingsService extends ChangeNotifier {
     notifyListeners();
   }
 
-  set resX(int value) {
-    _resX = value;
-    _prefs.setInt(_keyResX, value);
-    notifyListeners();
-  }
-
-  set resY(int value) {
-    _resY = value;
-    _prefs.setInt(_keyResY, value);
-    notifyListeners();
-  }
-
   set noOverlap(bool value) {
     _noOverlap = value;
     _prefs.setBool(_keyNoOverlap, value);
     notifyListeners();
   }
 
-  set showScroll(bool value) {
-    _showScroll = value;
-    _prefs.setBool(_keyShowScroll, value);
+  set filter(DanmakuFilter value) {
+    _filter = value;
+    _prefs.setInt(_keyFilter, value.index);
     notifyListeners();
   }
 
-  set showFixed(bool value) {
-    _showFixed = value;
-    _prefs.setBool(_keyShowFixed, value);
+  set dedupe(bool value) {
+    _dedupe = value;
+    _prefs.setBool(_keyDedupe, value);
     notifyListeners();
   }
 }

@@ -44,6 +44,20 @@ android {
         }
     }
 
+    // abiFilters 管不住 Flutter Gradle 插件自己塞进来的 libflutter.so / libapp.so,
+    // 不加这段的话 APK 里会多出 armeabi-v7a 与 x86_64 两套引擎(约 32MB 未压缩),
+    // 而它们没有配套的 libffmpeg.so,装上去也合并不了。这里直接从打包阶段剔除。
+    packaging {
+        jniLibs {
+            excludes += listOf(
+                "lib/armeabi-v7a/**",
+                "lib/armeabi/**",
+                "lib/x86/**",
+                "lib/x86_64/**",
+            )
+        }
+    }
+
     signingConfigs {
         create("release") {
             if (keystorePropertiesFile.exists()) {

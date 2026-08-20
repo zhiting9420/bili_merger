@@ -4,6 +4,13 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
 
+    <!-- 弹幕烧录是分钟~小时级的转码任务。Android 12+ 会冻结 cached 进程,
+         ffmpeg 作为本进程的子进程会一起被 SIGSTOP,所以必须挂一个前台服务。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <!-- 只用来显示烧录进度条;被拒绝也不影响烧录本身。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
     <application
         android:label="BiliMerger"
         android:name="${applicationName}"
@@ -32,6 +39,11 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
+        <service
+            android:name=".BurnService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"/>
+
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

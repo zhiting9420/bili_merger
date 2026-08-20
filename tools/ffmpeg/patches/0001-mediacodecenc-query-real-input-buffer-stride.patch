@@ -1,0 +1,156 @@
+--- a/libavcodec/mediacodec_wrapper.h
++++ b/libavcodec/mediacodec_wrapper.h
+@@ -218,6 +218,9 @@
+     ssize_t (*dequeueOutputBuffer)(FFAMediaCodec* codec, FFAMediaCodecBufferInfo *info, int64_t timeoutUs);
+     FFAMediaFormat* (*getOutputFormat)(FFAMediaCodec* codec);
+ 
++    /* May be NULL, and may return NULL (needs Android API level 28). */
++    FFAMediaFormat* (*getInputFormat)(FFAMediaCodec* codec);
++
+     int (*releaseOutputBuffer)(FFAMediaCodec* codec, size_t idx, int render);
+     int (*releaseOutputBufferAtTime)(FFAMediaCodec *codec, size_t idx, int64_t timestampNs);
+ 
+@@ -309,6 +312,13 @@
+     return codec->getOutputFormat(codec);
+ }
+ 
++static inline FFAMediaFormat* ff_AMediaCodec_getInputFormat(FFAMediaCodec* codec)
++{
++    if (!codec->getInputFormat)
++        return NULL;
++    return codec->getInputFormat(codec);
++}
++
+ static inline int ff_AMediaCodec_releaseOutputBuffer(FFAMediaCodec* codec, size_t idx, int render)
+ {
+     return codec->releaseOutputBuffer(codec, idx, render);
+--- a/libavcodec/mediacodec_wrapper.c
++++ b/libavcodec/mediacodec_wrapper.c
+@@ -1863,6 +1863,9 @@
+     media_status_t (*signalEndOfInputStream)(AMediaCodec *);
+     media_status_t (*setAsyncNotifyCallback)(AMediaCodec *,
+             struct AMediaCodecOnAsyncNotifyCallback callback, void *userdata);
++
++    // Available since API level 28.
++    AMediaFormat *(*getInputFormat)(AMediaCodec *);
+ } FFAMediaCodecNdk;
+ 
+ static const FFAMediaFormat media_format_ndk;
+@@ -2102,6 +2105,8 @@
+     GET_SYMBOL(signalEndOfInputStream)
+     GET_SYMBOL(setAsyncNotifyCallback)
+ 
++    GET_SYMBOL(getInputFormat)
++
+ #undef GET_SYMBOL
+ 
+     switch (method) {
+@@ -2288,6 +2293,20 @@
+     return mediaformat_ndk_create(format);
+ }
+ 
++static FFAMediaFormat* mediacodec_ndk_getInputFormat(FFAMediaCodec* ctx)
++{
++    FFAMediaCodecNdk *codec = (FFAMediaCodecNdk *)ctx;
++    AMediaFormat *format;
++
++    if (!codec->getInputFormat)
++        return NULL;
++
++    format = codec->getInputFormat(codec->impl);
++    if (!format)
++        return NULL;
++    return mediaformat_ndk_create(format);
++}
++
+ static int mediacodec_ndk_releaseOutputBuffer(FFAMediaCodec* ctx, size_t idx, int render)
+ {
+     FFAMediaCodecNdk *codec = (FFAMediaCodecNdk *)ctx;
+@@ -2510,6 +2529,7 @@
+ 
+     .dequeueOutputBuffer = mediacodec_ndk_dequeueOutputBuffer,
+     .getOutputFormat = mediacodec_ndk_getOutputFormat,
++    .getInputFormat = mediacodec_ndk_getInputFormat,
+ 
+     .releaseOutputBuffer = mediacodec_ndk_releaseOutputBuffer,
+     .releaseOutputBufferAtTime = mediacodec_ndk_releaseOutputBufferAtTime,
+--- a/libavcodec/mediacodecenc.c
++++ b/libavcodec/mediacodecenc.c
+@@ -71,6 +71,11 @@
+     int fps;
+     int width;
+     int height;
++    /* Real layout of the codec input buffers, queried from the codec after
++     * start().  Falls back to width/height when the platform does not tell
++     * us (Android API < 28). */
++    int stride;
++    int slice_height;
+ 
+     uint8_t *extradata;
+     int extradata_size;
+@@ -225,19 +230,22 @@
+     uint8_t *dst_data[4] = {};
+     int dst_linesize[4] = {};
+ 
++    int stride = s->stride > 0 ? s->stride : s->width;
++    int slice_h = s->slice_height > 0 ? s->slice_height : s->height;
++
+     if (avctx->pix_fmt == AV_PIX_FMT_YUV420P) {
+         dst_data[0] = dst;
+-        dst_data[1] = dst + s->width * s->height;
+-        dst_data[2] = dst_data[1] + s->width * s->height / 4;
++        dst_data[1] = dst + stride * slice_h;
++        dst_data[2] = dst_data[1] + stride * slice_h / 4;
+ 
+-        dst_linesize[0] = s->width;
+-        dst_linesize[1] = dst_linesize[2] = s->width / 2;
++        dst_linesize[0] = stride;
++        dst_linesize[1] = dst_linesize[2] = stride / 2;
+     } else if (avctx->pix_fmt == AV_PIX_FMT_NV12) {
+         dst_data[0] = dst;
+-        dst_data[1] = dst + s->width * s->height;
++        dst_data[1] = dst + stride * slice_h;
+ 
+-        dst_linesize[0] = s->width;
+-        dst_linesize[1] = s->width;
++        dst_linesize[0] = stride;
++        dst_linesize[1] = stride;
+     } else {
+         av_assert0(0);
+     }
+@@ -616,6 +624,35 @@
+         goto bailout;
+     }
+ 
++    /* The codec is free to hand us input buffers whose line stride and plane
++     * height differ from the configured width/height (e.g. width 1440 is
++     * commonly padded to a 1536-byte stride).  Ask for the real geometry
++     * instead of assuming stride == width, which produces a sheared/green
++     * picture on every device that pads more than we do. */
++    if (avctx->pix_fmt != AV_PIX_FMT_MEDIACODEC) {
++        FFAMediaFormat *in_format = ff_AMediaCodec_getInputFormat(s->codec);
++
++        s->stride = s->width;
++        s->slice_height = s->height;
++        if (in_format) {
++            int32_t v;
++            if (ff_AMediaFormat_getInt32(in_format, "stride", &v) && v > 0)
++                s->stride = v;
++            if (ff_AMediaFormat_getInt32(in_format, "slice-height", &v) && v > 0)
++                s->slice_height = v;
++            ff_AMediaFormat_delete(in_format);
++        }
++        if (s->stride < s->width || s->slice_height < s->height) {
++            av_log(avctx, AV_LOG_WARNING,
++                   "Bogus input buffer geometry %dx%d for %dx%d, ignoring\n",
++                   s->stride, s->slice_height, s->width, s->height);
++            s->stride = s->width;
++            s->slice_height = s->height;
++        }
++        av_log(avctx, AV_LOG_DEBUG, "MediaCodec input buffer: stride=%d slice-height=%d\n",
++               s->stride, s->slice_height);
++    }
++
+     ret = mediacodec_generate_extradata(avctx);
+ 
+ bailout:

@@ -17,15 +17,24 @@ import 'services/update_service.dart';
 class AppInfo {
   static const String name = "BiliMerger";
   static const String subtitle = "哔哩哔哩缓存视频和弹幕提取工具";
-  static const String version = "1.0.0";
+  static const String version = "1.1.0";
   static const String author = "至庭";
   static const String repo = "zhiting9420/bili_merger";
   static const String githubUrl = "https://github.com/$repo";
 }
 
+/// 合并方式。两条路径的产物完全不同,所以在开始前必须让用户明确选一次。
+enum MergeMode {
+  /// 快速合并:`-c copy` 直接封装,秒级完成,弹幕另存为外挂 .ass。
+  fast,
+
+  /// 弹幕烧录:弹幕画进画面像素,输出单个自带弹幕的 MP4,需要重新编码。
+  burn,
+}
+
 /// 在后台 isolate 中转换弹幕(供 compute 使用),避免大文件阻塞 UI 线程。
-String _convertDanmaku((String, DanmakuOptions) args) =>
-    XmlToAssConverter.convert(args.$1, options: args.$2);
+DanmakuResult _convertDanmaku((String, DanmakuOptions) args) =>
+    XmlToAssConverter.convertWithStats(args.$1, options: args.$2);
 
 void main() {
   runApp(
@@ -47,6 +56,12 @@ class AppState extends ChangeNotifier {
   bool _processing = false;
   final List<String> _logs = [];
   final Map<String, String> _itemStatus = {};
+  // 勾选待合并的视频,以 videoPath 为键。扫描后默认全选。
+  final Set<String> _selected = {};
+  // 用户点了「中断导出」。当前条目会被立即结束,剩余条目不再开始。
+  bool _cancelRequested = false;
+  // 烧录进度 0.0~1.0,以 videoPath 为键。只有烧录模式会填,快速合并是秒级的没必要。
+  final Map<String, double> _itemProgress = {};
 
   String? get inputDir => _inputDir;
   String? get outputDir => _outputDir;
@@ -55,6 +70,47 @@ class AppState extends ChangeNotifier {
   bool get processing => _processing;
   List<String> get logs => _logs;
   Map<String, String> get itemStatus => _itemStatus;
+  Set<String> get selected => _selected;
+  bool get cancelRequested => _cancelRequested;
+  Map<String, double> get itemProgress => _itemProgress;
+
+  /// 传 null 表示这一条已经结束,把进度条撤掉。
+  void setItemProgress(String videoPath, double? value) {
+    if (value == null) {
+      if (_itemProgress.remove(videoPath) == null) return;
+    } else {
+      _itemProgress[videoPath] = value;
+    }
+    notifyListeners();
+  }
+
+  set cancelRequested(bool value) {
+    _cancelRequested = value;
+    notifyListeners();
+  }
+
+  bool isSelected(BiliVideoItem item) => _selected.contains(item.videoPath);
+  int get selectedCount => _selected.length;
+  bool get allSelected =>
+      _items.isNotEmpty && _selected.length == _items.length;
+
+  List<BiliVideoItem> get selectedItems =>
+      _items.where((i) => _selected.contains(i.videoPath)).toList();
+
+  void toggleSelected(BiliVideoItem item) {
+    if (!_selected.remove(item.videoPath)) {
+      _selected.add(item.videoPath);
+    }
+    notifyListeners();
+  }
+
+  void setAllSelected(bool value) {
+    _selected.clear();
+    if (value) {
+      _selected.addAll(_items.map((i) => i.videoPath));
+    }
+    notifyListeners();
+  }
 
   set inputDir(String? value) {
     _inputDir = value;
@@ -68,6 +124,10 @@ class AppState extends ChangeNotifier {
 
   set items(List<BiliVideoItem> value) {
     _items = value;
+    // 新一轮扫描的结果默认全选。
+    _selected
+      ..clear()
+      ..addAll(value.map((i) => i.videoPath));
     notifyListeners();
   }
 
@@ -192,27 +252,44 @@ class HomeView extends StatelessWidget {
                 ],
               ),
             ),
+            if (!state.scanning && state.items.isNotEmpty)
+              _buildSelectionBar(context, state),
             Expanded(
               child: state.scanning
                   ? const Center(child: CircularProgressIndicator())
                   : state.items.isEmpty
                   ? _buildEmpty(context)
                   : ListView.builder(
-                      padding: const EdgeInsets.all(16),
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 88),
                       itemCount: state.items.length,
                       itemBuilder: (context, index) {
                         final item = state.items[index];
                         final status = state.itemStatus[item.videoPath];
+                        final checked = state.isSelected(item);
                         return Card(
                           margin: const EdgeInsets.only(bottom: 8),
                           child: ListTile(
-                            leading: _VideoThumb(item.videoPath),
+                            onTap: state.processing
+                                ? null
+                                : () => state.toggleSelected(item),
+                            leading: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Checkbox(
+                                  value: checked,
+                                  onChanged: state.processing
+                                      ? null
+                                      : (_) => state.toggleSelected(item),
+                                ),
+                                _VideoThumb(item.videoPath),
+                              ],
+                            ),
                             title: Text(
                               item.title,
                               maxLines: 2,
                               overflow: TextOverflow.ellipsis,
                             ),
-                            subtitle: Text(status ?? _itemSubtitle(item)),
+                            subtitle: _buildItemSubtitle(state, item, status),
                             trailing: _buildStatusIcon(status),
                           ),
                         );
@@ -222,13 +299,101 @@ class HomeView extends StatelessWidget {
           ],
         ),
       ),
-      floatingActionButton: state.items.isNotEmpty && !state.processing
+      floatingActionButton: state.processing
           ? FloatingActionButton.extended(
-              onPressed: () => _startMerge(context),
-              label: const Text("开始合并"),
+              onPressed: state.cancelRequested
+                  ? null
+                  : () => _cancelMerge(context),
+              backgroundColor: Theme.of(context).colorScheme.errorContainer,
+              foregroundColor: Theme.of(context).colorScheme.onErrorContainer,
+              icon: state.cancelRequested
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.stop_circle_outlined),
+              label: Text(
+                state.cancelRequested
+                    ? "正在中断…"
+                    : (state.itemProgress.isEmpty
+                          ? "导出中 · 点击中断"
+                          : "烧录中 · 点击中断"),
+              ),
+            )
+          : state.items.isNotEmpty
+          ? FloatingActionButton.extended(
+              onPressed: state.selectedCount == 0
+                  ? null
+                  : () => _startMerge(context),
+              backgroundColor: state.selectedCount == 0
+                  ? Theme.of(context).disabledColor
+                  : null,
+              label: Text(
+                state.selectedCount == 0
+                    ? "未选择视频"
+                    : "合并选中 ${state.selectedCount} 个",
+              ),
               icon: const Icon(Icons.merge),
             )
           : null,
+    );
+  }
+
+  /// 列表顶部的全选工具条:显示勾选进度,一键全选/全不选。
+  Widget _buildSelectionBar(BuildContext context, AppState state) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+      child: Row(
+        children: [
+          Checkbox(
+            value: state.allSelected
+                ? true
+                : (state.selectedCount == 0 ? false : null),
+            tristate: true,
+            onChanged: state.processing
+                ? null
+                : (_) => state.setAllSelected(!state.allSelected),
+          ),
+          Expanded(
+            child: Text(
+              "已选 ${state.selectedCount} / ${state.items.length} 个视频",
+              style: Theme.of(
+                context,
+              ).textTheme.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ),
+          TextButton(
+            onPressed: state.processing
+                ? null
+                : () => state.setAllSelected(!state.allSelected),
+            child: Text(state.allSelected ? "全不选" : "全选"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 烧录时把状态行换成进度条。快速合并没有进度可言(几秒就完事),仍显示原来的文案。
+  Widget _buildItemSubtitle(
+    AppState state,
+    BiliVideoItem item,
+    String? status,
+  ) {
+    final progress = state.itemProgress[item.videoPath];
+    if (progress == null) return Text(status ?? _itemSubtitle(item));
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text("烧录中 ${(progress * 100).toStringAsFixed(0)}%"),
+        const SizedBox(height: 5),
+        ClipRRect(
+          borderRadius: BorderRadius.circular(3),
+          child: LinearProgressIndicator(value: progress, minHeight: 5),
+        ),
+      ],
     );
   }
 
@@ -237,6 +402,9 @@ class HomeView extends StatelessWidget {
       return const Icon(Icons.check_circle, color: Colors.green);
     }
     if (status == "Failed") return const Icon(Icons.error, color: Colors.red);
+    if (status == "Cancelled") {
+      return const Icon(Icons.block, color: Colors.orange);
+    }
     if (status == "Processing...") {
       return const SizedBox(
         width: 20,
@@ -394,68 +562,384 @@ class HomeView extends StatelessWidget {
     );
   }
 
+  /// 中断导出:结束当前 ffmpeg 子进程,剩余条目不再开始。
+  Future<void> _cancelMerge(BuildContext context) async {
+    final state = context.read<AppState>();
+    state.cancelRequested = true;
+    state.addLog("正在中断导出…");
+    await FFmpegService.cancelMerge();
+  }
+
+  /// 把毫秒粗略说成「X 分钟 / X 小时 Y 分钟」,用于耗时预估,不需要精确到秒。
+  static String _fmtRoughDuration(int ms) {
+    final min = (ms / 60000).ceil().clamp(1, 1 << 30);
+    if (min < 60) return "$min 分钟";
+    final h = min ~/ 60;
+    final m = min % 60;
+    return m == 0 ? "$h 小时" : "$h 小时 $m 分钟";
+  }
+
+  /// 耗时区间。两端都不足一小时时合并单位,读作「2～10 分钟」而不是「2 分钟～10 分钟」。
+  static String _fmtEstimateRange(int loMs, int hiMs) {
+    final lo = (loMs / 60000).ceil().clamp(1, 1 << 30);
+    final hi = (hiMs / 60000).ceil().clamp(1, 1 << 30);
+    if (lo == hi) return _fmtRoughDuration(hiMs);
+    if (hi < 60) return "$lo～$hi 分钟";
+    return "${_fmtRoughDuration(loMs)}～${_fmtRoughDuration(hiMs)}";
+  }
+
+  /// 烧录目标码率。
+  ///
+  /// MediaCodec 不支持 CRF,必须给一个绝对码率;直接写死会让低码率的缓存视频白白膨胀。
+  /// 这里按「源视频实际码率」推算:B 站缓存多为 HEVC,同画质换成 H.264 大约要多花
+  /// 1.6~2 倍码率,再加上烧进画面的弹幕本身是高频细节,取 2.5 倍并夹在合理区间。
+  static int _targetBitrateKbps(BiliVideoItem item) {
+    try {
+      final durSec = (item.durationMs ?? 0) / 1000.0;
+      if (durSec <= 1) return 4000;
+      final bytes = File(item.videoPath).lengthSync();
+      final srcKbps = bytes * 8 / durSec / 1000;
+      return (srcKbps * 2.5).round().clamp(2000, 10000);
+    } catch (_) {
+      return 4000;
+    }
+  }
+
+  /// 开始前让用户选合并方式。两者产物差别很大(外挂字幕 vs 烧进像素),
+  /// 而且烧录是分钟级的,不该让用户点一下才发现要等半小时。
+  Future<MergeMode?> _askMergeMode(
+    BuildContext context,
+    List<BiliVideoItem> targets,
+  ) {
+    final scheme = Theme.of(context).colorScheme;
+    // 烧录不可逆,所以把当前生效的筛选模式直接摆在弹窗里,不让用户点下去才发现不对。
+    final settings = context.read<SettingsService>();
+    final featured = settings.filter == DanmakuFilter.featured;
+    // 「解析并合并弹幕」是弹幕功能的总开关。它关着时设置页会隐藏整个筛选区,
+    // 此时若还允许烧录,弹幕会被永久烧进画面,而弹窗里「可在设置页更改」
+    // 的指引指向一个看不见的开关。
+    final danmakuOff = !settings.parseDanmaku;
+    final filterLine = featured
+        ? "本次使用「精选弹幕」— 静止不飘,约保留两成,遮挡最小。"
+        : "本次使用「全部弹幕」— 含滚动弹幕,约保留七成,会明显遮挡画面。";
+    final totalMs = targets.fold<int>(0, (sum, i) => sum + (i.durationMs ?? 0));
+    final withDanmaku = targets.where((i) => i.danmakuPath != null).length;
+    // 给区间而不是单点:实测骁龙 8 Gen2 级机型硬件编码约 9~11 倍实时速度(下界取 10 倍),
+    // 而低端机或回退到 libx264 时会掉到 2 倍上下(上界)。报单点必然在一头骗人。
+    final estimate = totalMs > 0
+        ? "预计 ${_fmtEstimateRange(totalMs ~/ 10, totalMs ~/ 2)}"
+        : "耗时取决于视频总时长";
+
+    Widget option({
+      required IconData icon,
+      required String title,
+      required String desc,
+      required Color color,
+      required VoidCallback? onTap,
+    }) {
+      return Card(
+        elevation: 0,
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.4),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: BorderSide(color: scheme.outlineVariant),
+        ),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(14),
+          onTap: onTap,
+          child: Opacity(
+            opacity: onTap == null ? 0.45 : 1,
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(icon, color: color, size: 26),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          title,
+                          style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 15,
+                          ),
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          desc,
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            height: 1.45,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return showDialog<MergeMode>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text("选择合并方式"),
+        contentPadding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              option(
+                icon: Icons.flash_on,
+                color: scheme.primary,
+                title: "快速合并",
+                desc:
+                    "直接封装,不重新编码,几秒完成。\n"
+                    "弹幕另存为 .ass 外挂字幕,需要播放器支持才能看到。",
+                onTap: () => Navigator.pop(ctx, MergeMode.fast),
+              ),
+              const SizedBox(height: 4),
+              option(
+                icon: Icons.local_fire_department,
+                color: scheme.error,
+                title: "弹幕烧录",
+                desc: danmakuOff
+                    ? "设置页的「解析并合并弹幕」当前是关闭的,先打开才能烧录。"
+                    : withDanmaku == 0
+                    ? "所选视频都没有弹幕缓存,无法烧录。"
+                    : "弹幕直接画进画面,输出单个 MP4,任何播放器都能看到。\n"
+                          "需要逐帧重新编码,$estimate(取决于机型与弹幕密度),"
+                          "并且会明显发热耗电。\n"
+                          "$filterLine(可在设置页更改)",
+                onTap: (withDanmaku == 0 || danmakuOff)
+                    ? null
+                    : () => Navigator.pop(ctx, MergeMode.burn),
+              ),
+              if (withDanmaku > 0 && withDanmaku < targets.length)
+                Padding(
+                  padding: const EdgeInsets.only(top: 10),
+                  child: Text(
+                    "注意:$withDanmaku / ${targets.length} 个视频有弹幕缓存,"
+                    "其余会按快速合并处理。",
+                    style: TextStyle(fontSize: 12, color: scheme.error),
+                  ),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("取消"),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 烧录单个视频。返回是否成功。
+  ///
+  /// .ass 写在原生给的私有工作目录里、跑完即删 —— 烧录的产物就是自带弹幕的单个 MP4,
+  /// 不该再往用户的输出目录丢外挂字幕。
+  Future<bool> _burnOne(
+    AppState state,
+    SettingsService settings,
+    BurnEnv env,
+    BiliVideoItem item,
+    String outPath,
+    int index,
+    int total,
+  ) async {
+    final assFile = File("${env.workDir}/burn.ass");
+    try {
+      if (item.danmakuPath == null) {
+        state.addLog("无弹幕缓存,按快速合并处理: ${item.title}");
+        return await FFmpegService.mergeVideoAudio(
+          item.videoPath,
+          item.audioPath,
+          outPath,
+        );
+      }
+
+      final xml = await File(item.danmakuPath!).readAsString();
+      final result = await compute(_convertDanmaku, (
+        xml,
+        settings.burnDanmakuOptions(env.fontFamily),
+      ));
+      await assFile.writeAsString(result.ass);
+      state.addLog(result.summary);
+
+      state.setItemProgress(item.videoPath, 0.0);
+      final encoder = await FFmpegService.burnDanmaku(
+        videoPath: item.videoPath,
+        audioPath: item.audioPath,
+        assPath: assFile.path,
+        outputPath: outPath,
+        durationMs: item.durationMs ?? 0,
+        bitrateKbps: _targetBitrateKbps(item),
+        label: "($index/$total) ${item.title}",
+      );
+      if (encoder == null) return false;
+      state.addLog(
+        "烧录完成(${encoder == 'h264_mediacodec' ? '硬件编码' : '软件编码'}): ${item.title}",
+      );
+      return true;
+    } catch (e) {
+      state.addLog("烧录失败: $e");
+      return false;
+    } finally {
+      state.setItemProgress(item.videoPath, null);
+      try {
+        if (await assFile.exists()) await assFile.delete();
+      } catch (_) {}
+    }
+  }
+
   Future<void> _startMerge(BuildContext context) async {
     final state = context.read<AppState>();
     final settings = context.read<SettingsService>();
+    final messenger = ScaffoldMessenger.of(context);
 
     if (state.outputDir == null) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text("请先选择输出目录")));
+      messenger.showSnackBar(const SnackBar(content: Text("请先选择输出目录")));
       return;
     }
 
+    final targets = state.selectedItems;
+    if (targets.isEmpty) {
+      messenger.showSnackBar(const SnackBar(content: Text("请先勾选要合并的视频")));
+      return;
+    }
+
+    final mode = await _askMergeMode(context, targets);
+    if (mode == null) return;
+
+    // 立刻占位:下面还有请求通知权限、释放 4MB 字体这两个 await,
+    // 期间若按钮仍可点,第二次点击会并发跑起第二轮循环,两轮写同一个输出文件,
+    // 还会互相把 processing / cancelRequested 和前台服务掀掉。
     state.processing = true;
+    state.cancelRequested = false;
+    await FFmpegService.beginSession();
+
+    BurnEnv? env;
+    if (mode == MergeMode.burn) {
+      // 通知权限只决定通知栏进度条可见与否,拒绝了照样能烧,所以不检查结果。
+      await Permission.notification.request();
+      env = await FFmpegService.prepareBurn();
+      if (env == null) {
+        state.processing = false;
+        messenger.showSnackBar(
+          const SnackBar(content: Text("烧录环境准备失败:内置字体释放不出来")),
+        );
+        return;
+      }
+      FFmpegService.onBurnProgress = state.setItemProgress;
+    }
+
     state.clearLogs();
+    state.addLog(
+      "本次${mode == MergeMode.burn ? '烧录' : '合并'} "
+      "${targets.length} / ${state.items.length} 个视频",
+    );
 
     int success = 0;
+    int skipped = 0;
     List<String> failedTitles = [];
 
-    for (var item in state.items) {
+    for (var i = 0; i < targets.length; i++) {
+      final item = targets[i];
+      if (state.cancelRequested) {
+        skipped++;
+        state.itemStatus[item.videoPath] = "Cancelled";
+        continue;
+      }
       final outPath = "${state.outputDir}/${item.title}.mp4";
       state.itemStatus[item.videoPath] = "Processing...";
-      state.addLog("正在合并: ${item.title}");
+      state.addLog("正在${mode == MergeMode.burn ? '烧录' : '合并'}: ${item.title}");
 
-      if (settings.parseDanmaku && item.danmakuPath != null) {
-        try {
-          final xml = await File(item.danmakuPath!).readAsString();
-          // 放到后台 isolate 转换,避免大弹幕文件阻塞 UI
-          final ass = await compute(_convertDanmaku, (
-            xml,
-            settings.danmakuOptions,
-          ));
-          await File("${state.outputDir}/${item.title}.ass").writeAsString(ass);
-        } catch (e) {
-          state.addLog("弹幕生成失败: $e");
+      bool ok;
+      if (mode == MergeMode.burn) {
+        ok = await _burnOne(
+          state,
+          settings,
+          env!,
+          item,
+          outPath,
+          i + 1,
+          targets.length,
+        );
+      } else {
+        if (settings.parseDanmaku && item.danmakuPath != null) {
+          try {
+            final xml = await File(item.danmakuPath!).readAsString();
+            // 放到后台 isolate 转换,避免大弹幕文件阻塞 UI
+            final result = await compute(_convertDanmaku, (
+              xml,
+              settings.danmakuOptions,
+            ));
+            await File(
+              "${state.outputDir}/${item.title}.ass",
+            ).writeAsString(result.ass);
+            state.addLog(result.summary);
+          } catch (e) {
+            state.addLog("弹幕生成失败: $e");
+          }
         }
+        ok = await FFmpegService.mergeVideoAudio(
+          item.videoPath,
+          item.audioPath,
+          outPath,
+        );
       }
 
-      final ok = await FFmpegService.mergeVideoAudio(
-        item.videoPath,
-        item.audioPath,
-        outPath,
-      );
       if (ok) {
         success++;
         state.itemStatus[item.videoPath] = "Success";
+      } else if (state.cancelRequested) {
+        // 中断导致的失败不算错误,半成品文件已由原生侧删除。
+        state.itemStatus[item.videoPath] = "Cancelled";
+        state.addLog("已中断: ${item.title}");
       } else {
         state.itemStatus[item.videoPath] = "Failed";
         failedTitles.add(item.title);
       }
     }
 
+    if (mode == MergeMode.burn) {
+      FFmpegService.onBurnProgress = null;
+      await FFmpegService.finishBurnSession();
+    }
+
+    final wasCancelled = state.cancelRequested;
     state.processing = false;
+    state.cancelRequested = false;
 
     if (context.mounted) {
       showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: Text(failedTitles.isEmpty ? "全部任务完成" : "合并任务结束"),
+          title: Text(
+            wasCancelled
+                ? "已中断"
+                : (failedTitles.isEmpty ? "全部任务完成" : "合并任务结束"),
+          ),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text("成功: $success / ${state.items.length}"),
+              Text(
+                wasCancelled
+                    ? "已中断 — 成功 $success / ${targets.length}，未处理 $skipped 个"
+                    : "成功: $success / ${targets.length}",
+              ),
               if (failedTitles.isNotEmpty) ...[
                 const SizedBox(height: 12),
                 const Text(
@@ -534,22 +1018,49 @@ class SettingsView extends StatelessWidget {
           ),
           if (settings.parseDanmaku) ...[
             const Divider(),
-            _buildSectionHeader(context, "精细过滤 (B站原生)"),
-            SwitchListTile(
-              title: const Text("显示滚动弹幕"),
-              subtitle: const Text("普通飞过的弹幕"),
-              value: settings.showScroll,
-              onChanged: (v) => settings.showScroll = v,
+            _buildSectionHeader(context, "弹幕筛选"),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+              child: SegmentedButton<DanmakuFilter>(
+                segments: const [
+                  ButtonSegment(
+                    value: DanmakuFilter.featured,
+                    icon: Icon(Icons.star_outline),
+                    label: Text("精选弹幕"),
+                  ),
+                  ButtonSegment(
+                    value: DanmakuFilter.all,
+                    icon: Icon(Icons.forum_outlined),
+                    label: Text("全部弹幕"),
+                  ),
+                ],
+                selected: {settings.filter},
+                onSelectionChanged: (v) => settings.filter = v.first,
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 12),
+              child: Text(
+                settings.filter == DanmakuFilter.featured
+                    ? "只保留彩色、顶部/底部、以及 B 站权重最高档的弹幕，"
+                          "滤掉刷屏的普通白色滚动弹幕。实测约保留两成，画面清爽很多。\n"
+                          "外挂 .ass 与弹幕烧录都按这个设置来。"
+                    : "在精选的基础上加回普通滚动弹幕，还原 B 站的观看体验。\n"
+                          "外挂 .ass 与弹幕烧录都按这个设置来；烧进画面不可逆，请谨慎。",
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
             ),
             SwitchListTile(
-              title: const Text("显示固定弹幕"),
-              subtitle: const Text("顶部/底部的悬浮弹幕"),
-              value: settings.showFixed,
-              onChanged: (v) => settings.showFixed = v,
+              title: const Text("同款弹幕去重"),
+              subtitle: const Text("内容完全相同的弹幕只保留最早的一条"),
+              value: settings.dedupe,
+              onChanged: (v) => settings.dedupe = v,
             ),
             SwitchListTile(
               title: const Text("防止弹幕重叠"),
-              subtitle: const Text("智能分配轨道，避免同屏滚动弹幕叠在一起"),
+              subtitle: const Text("按轨道排布并保证互不遮挡；显示区域放不下的弹幕会被舍弃"),
               value: settings.noOverlap,
               onChanged: (v) => settings.noOverlap = v,
             ),
@@ -571,7 +1082,9 @@ class SettingsView extends StatelessWidget {
                         builder: (ctx) => AlertDialog(
                           title: const Text("关于字体渲染"),
                           content: const Text(
-                            "注意：.ass 弹幕文件依赖播放器环境。如果播放器未安装对应字体，会回退到系统默认字体。建议使用 MX Player 或弹弹 Play 以获得更好展示。",
+                            "注意：.ass 弹幕文件依赖播放器环境。如果播放器未安装对应字体，会回退到系统默认字体。建议使用 MX Player 或弹弹 Play 以获得更好展示。\n\n"
+                            "这里的选择只影响「快速合并」导出的外挂 .ass。「弹幕烧录」固定使用随应用打包的中文字体，"
+                            "因为内置 ffmpeg 没有 fontconfig，只能认这一份字体，换成别的会渲染成方框。",
                           ),
                           actions: [
                             TextButton(
@@ -612,8 +1125,9 @@ class SettingsView extends StatelessWidget {
               2.0,
               0.1,
               (v) => settings.speed = v,
-              "${settings.speed.toStringAsFixed(1)}x",
+              "${settings.speed.toStringAsFixed(2)}x",
               Icons.speed,
+              hint: "越快则轨道周转越快,同屏弹幕更少、能保留的弹幕更多,播放也更流畅",
             ),
             _buildSlider(
               context,
@@ -636,33 +1150,9 @@ class SettingsView extends StatelessWidget {
               (v) => settings.fontSize = v.toInt(),
               "${settings.fontSize} px",
               Icons.format_size,
-            ),
-
-            Padding(
-              padding: const EdgeInsets.all(16.0),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    "弹幕画质 (PlayResY)",
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 8),
-                  SegmentedButton<int>(
-                    segments: const [
-                      ButtonSegment(value: 720, label: Text("720P")),
-                      ButtonSegment(value: 1080, label: Text("1080P")),
-                      ButtonSegment(value: 1440, label: Text("2K")),
-                      ButtonSegment(value: 2160, label: Text("4K")),
-                    ],
-                    selected: {settings.resY},
-                    onSelectionChanged: (Set<int> val) {
-                      settings.resY = val.first;
-                      settings.resX = (val.first * 16 / 9).round();
-                    },
-                  ),
-                ],
-              ),
+              hint:
+                  "弹幕高度约占画面 ${(settings.fontSize / 1080 * 100).toStringAsFixed(1)}%"
+                  "（B 站默认观感在 4% 左右）",
             ),
 
             Padding(
@@ -757,11 +1247,13 @@ class SettingsView extends StatelessWidget {
     double divisions,
     Function(double) onChanged,
     String display,
-    IconData icon,
-  ) {
+    IconData icon, {
+    String? hint,
+  }) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16.0),
       child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
@@ -786,6 +1278,16 @@ class SettingsView extends StatelessWidget {
             divisions: ((max - min) / divisions).round(),
             onChanged: onChanged,
           ),
+          if (hint != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                hint,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
         ],
       ),
     );
