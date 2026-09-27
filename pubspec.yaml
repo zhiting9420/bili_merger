@@ -1,0 +1,37 @@
+name: bili_merger
+description: 哔哩哔哩缓存视频和弹幕提取工具
+publish_to: 'none'
+version: 1.1.0+3
+
+environment:
+  sdk: ^3.10.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  xml: ^6.6.1
+  path: ^1.9.0
+  permission_handler: ^12.0.1
+  provider: ^6.0.5
+  shared_preferences: ^2.1.1
+  url_launcher: ^6.3.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: assets/icon_legacy.png
+  adaptive_icon_background: assets/icon_background.png
+  adaptive_icon_foreground: assets/icon_foreground.png
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon.png
+    # libass 未启用 fontconfig，烧录需随包提供中文字体。
+    - assets/fonts/
